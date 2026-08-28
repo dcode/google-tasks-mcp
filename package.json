@@ -1,7 +1,7 @@
 {
   "name": "google-tasks-mcp",
-  "version": "0.2.0",
-  "description": "MCP server for Google Tasks with full task-list CRUD and a change-harvesting diff tool. One auth command, then npx-runnable anywhere.",
+  "version": "0.3.0",
+  "description": "MCP server for Google Tasks with full task-list CRUD, a change-harvesting diff tool, and multi-tenant HTTP hosting for OAuth-aware gateways like Obot.",
   "type": "module",
   "bin": {
     "google-tasks-mcp": "dist/index.js"
