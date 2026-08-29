@@ -28,14 +28,20 @@ import os from "node:os";
 import process from "node:process";
 import { AsyncLocalStorage } from "node:async_hooks";
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const SCOPES = ["https://www.googleapis.com/auth/tasks"];
+const GOOGLE_AUTHORIZATION_SERVER = "https://accounts.google.com";
+const PROTECTED_RESOURCE_PATH = "/.well-known/oauth-protected-resource/mcp";
 
 const CONFIG_DIR =
   process.env.GTASKS_MCP_DIR ?? path.join(os.homedir(), ".config", "google-tasks-mcp");
 const CREDENTIALS_PATH =
   process.env.GTASKS_MCP_CREDENTIALS ?? path.join(CONFIG_DIR, "client_secret.json");
 const TOKEN_PATH = process.env.GTASKS_MCP_TOKEN ?? path.join(CONFIG_DIR, "token.json");
+// HTTP mode only: the externally-reachable base URL this server is deployed at (e.g.
+// https://google-tasks-mcp.example.com). Needed to advertise RFC 9728 protected-resource
+// metadata pointing back at itself, and at Google as the authorization server.
+const PUBLIC_URL = process.env.GTASKS_MCP_PUBLIC_URL;
 
 // ---------------------------------------------------------------------------
 // Auth
@@ -551,9 +557,22 @@ function buildServer(): McpServer {
  * credentials JSON from README.md) does that per user and forwards each
  * request with `Authorization: Bearer <google-access-token>`. Every request
  * is (re)verified against Google, so nothing is trusted just because it came
- * through the gateway.
+ * through the gateway. The gateway finds Google in the first place via the
+ * RFC 9728 protected-resource metadata served at PROTECTED_RESOURCE_PATH,
+ * advertised in every 401's `WWW-Authenticate: ... resource_metadata="..."`.
  */
 async function runHttpServer(port: number): Promise<void> {
+  if (!PUBLIC_URL) {
+    console.error(
+      "GTASKS_MCP_PUBLIC_URL is required in HTTP mode: the externally-reachable base URL " +
+        "this server is deployed at (e.g. https://google-tasks-mcp.example.com), used to " +
+        "advertise RFC 9728 protected-resource metadata so an OAuth-aware gateway can discover " +
+        "Google as the authorization server."
+    );
+    process.exit(1);
+  }
+  const resourceMetadataURL = `${PUBLIC_URL}${PROTECTED_RESOURCE_PATH}`;
+
   // Lazy imports: only HTTP mode pays for the transport/HTTP-adapter code.
   const { createServer: createHttpServer } = await import("node:http");
   const { StreamableHTTPServerTransport } = await import(
@@ -569,6 +588,20 @@ async function runHttpServer(port: number): Promise<void> {
 
       if (pathname === "/healthz") {
         res.writeHead(200, { "content-type": "text/plain" }).end("ok");
+        return;
+      }
+      if (pathname === PROTECTED_RESOURCE_PATH) {
+        // RFC 9728 protected-resource metadata: tells an OAuth-aware gateway that Google is the
+        // authorization server for this resource, so it can broker a real Google token instead
+        // of assuming this server runs its own OAuth.
+        res.writeHead(200, { "content-type": "application/json" }).end(
+          JSON.stringify({
+            resource: `${PUBLIC_URL}/mcp`,
+            authorization_servers: [GOOGLE_AUTHORIZATION_SERVER],
+            scopes_supported: SCOPES,
+            bearer_methods_supported: ["header"],
+          })
+        );
         return;
       }
       if (pathname !== "/mcp") {
@@ -587,7 +620,7 @@ async function runHttpServer(port: number): Promise<void> {
         res
           .writeHead(401, {
             "content-type": "application/json",
-            "www-authenticate": 'Bearer realm="google-tasks-mcp"',
+            "www-authenticate": `Bearer realm="google-tasks-mcp", resource_metadata="${resourceMetadataURL}"`,
           })
           .end(jsonRpcError(-32001, "Missing bearer token."));
         return;
@@ -603,7 +636,7 @@ async function runHttpServer(port: number): Promise<void> {
         res
           .writeHead(401, {
             "content-type": "application/json",
-            "www-authenticate": 'Bearer realm="google-tasks-mcp", error="invalid_token"',
+            "www-authenticate": `Bearer realm="google-tasks-mcp", error="invalid_token", resource_metadata="${resourceMetadataURL}"`,
           })
           .end(jsonRpcError(-32001, "Invalid or expired access token."));
         return;

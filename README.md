@@ -46,18 +46,24 @@ The Tasks API requires your own OAuth client. No verification, no billing.
 | `GTASKS_MCP_CREDENTIALS` | `<dir>/client_secret.json` | OAuth client file |
 | `GTASKS_MCP_TOKEN` | `<dir>/token.json` | Cached refresh token (stdio mode only) |
 | `PORT` | unset | Set to switch from stdio to multi-tenant HTTP mode (see below) |
+| `GTASKS_MCP_PUBLIC_URL` | — | **Required in HTTP mode.** The externally-reachable base URL this server is deployed at, e.g. `https://google-tasks-mcp.example.com` (no trailing slash). Used to advertise RFC 9728 protected-resource metadata so a gateway can discover Google as the authorization server. |
 
 ## Multi-user hosting (Obot and similar OAuth-aware gateways)
 
 Everything above is single-user: one refresh token, cached to disk, for whoever
-runs `auth`. Set `PORT` and the server switches modes entirely — it speaks
-[Streamable HTTP](https://modelcontextprotocol.io) on `POST /mcp` (plus a
-`GET /healthz`) instead of stdio, and stops managing anyone's credentials
-itself. In this mode the server is a pure OAuth **resource server**: it never
-runs the OAuth dance and never touches a refresh token. Something in front of
-it — an OAuth-aware gateway like [Obot](https://obot.ai)'s `mcp-oauth-proxy` —
-does that per user and forwards each request as
-`Authorization: Bearer <that user's Google access token>`.
+runs `auth`. Set `PORT` (and `GTASKS_MCP_PUBLIC_URL`) and the server switches
+modes entirely — it speaks [Streamable HTTP](https://modelcontextprotocol.io)
+on `POST /mcp` (plus a `GET /healthz` and a `GET
+/.well-known/oauth-protected-resource/mcp`) instead of stdio, and stops
+managing anyone's credentials itself. In this mode the server is a pure OAuth
+**resource server**: it never runs the OAuth dance and never touches a
+refresh token. Something in front of it — an OAuth-aware gateway like
+[Obot](https://obot.ai)'s `mcp-oauth-proxy` — does that per user and forwards
+each request as `Authorization: Bearer <that user's Google access token>`.
+The gateway finds Google in the first place via the RFC 9728 metadata this
+server serves at `/.well-known/oauth-protected-resource/mcp`, which every
+`401` response points at through its `WWW-Authenticate: ... resource_metadata="..."`
+parameter.
 
 ### Building the image
 
@@ -76,51 +82,49 @@ To build it yourself instead:
 
 ```bash
 docker build -t google-tasks-mcp .
-docker push <your-registry>/google-tasks-mcp:latest   # wherever Obot can pull from
+docker push <your-registry>/google-tasks-mcp:latest   # wherever you'll run it from
 ```
 
-### Adding it as an Obot Hosted Catalog entry
+### Adding it as an Obot catalog entry
 
-Runtime: **Containerized** — of Obot's three self-hosting runtimes (npx,
-uvx, containerized), this is the one that gets you a real per-user OAuth
-flow. npx/uvx spawn a short-lived local command; there's no browser-redirect
-consent flow wired to an ephemeral spawned process. Containerized (like
-`remote`) gives Obot's gateway a standing HTTP endpoint to broker OAuth
-against.
+Runtime: **Remote**, not Containerized. As of Obot v0.25.2, Obot's gateway
+only runs its OAuth-discovery/static-OAuth-broker logic
+(`CheckForMCPAuth` in `pkg/api/handlers/mcpgateway/oauth/mcpoauthhandler.go`)
+for catalog entries with `Runtime: Remote` — Containerized-runtime servers
+are explicitly treated as "no OAuth required" and Obot never contacts the
+upstream authorization server for them at all, no matter what this server
+returns. That's a confirmed, currently-open gap
+([obot-platform/obot#5372](https://github.com/obot-platform/obot/issues/5372)),
+not a configuration mistake — Containerized simply doesn't wire this up yet.
+Remote does, so Obot doesn't deploy the container for you; you run it
+yourself (the included `Dockerfile`/image works fine for this) somewhere
+Obot's gateway can reach over HTTPS. It must be a real, non-private address:
+Obot's remote-MCP-URL validation blocks loopback/private-IP targets by
+default, so an in-cluster-only Service address won't pass unless that
+validation is explicitly relaxed.
 
-**Containerized Runtime Configuration:**
-
-| Field | Value |
-|---|---|
-| Image | wherever you pushed the image above |
-| Port | `8080` (must match the Dockerfile's `PORT`) |
-| Path | `/mcp` |
-| Healthz | `/healthz` |
-| Command / Arguments | leave blank — the image's own `CMD` starts the server |
-
-**Configuration** (this is how the OAuth client JSON from the [Google Cloud
-setup](#google-cloud-setup-one-time-15-minutes) above reaches the container —
-Obot's "File" config type writes the value to a file *inside* the deployment
-and sets an env var, named by "Key", to that file's path):
+**Remote Server Configuration:**
 
 | Field | Value |
 |---|---|
-| Type | `File` |
-| Key | `GTASKS_MCP_CREDENTIALS` |
-| Value | `Static` — one admin-configured client shared by the whole deployment, not something each connecting user supplies (that's the "User-Supplied" option, which fits a per-user personal API key, not a shared OAuth client) |
-| Value Source | `Manual Value` (paste the JSON) or `Kubernetes Secret` (reference an existing secret — keeps the raw value out of Obot's own config store) |
-| Sensitive | on |
+| URL | `https://<your-host>/mcp` — wherever you deployed the image, with `PORT=8080`, `GTASKS_MCP_PUBLIC_URL=https://<your-host>` and `GTASKS_MCP_CREDENTIALS` set |
+| Advanced → Static OAuth | **required** — see below |
 
-The pasted JSON only needs a `client_id` — `{"client_id": "…"}` is enough
-(this mode never reads a client secret, so there's no reason to also paste
-one in). Separately, in Obot's own **MCP Server OAuth Configuration** screen
-(not this catalog entry's config), enter that same client's Client ID *and*
-Client Secret — that's what lets Obot's gateway actually run the Google OAuth
-flow per user and forward each user's resulting access token as
-`Authorization: Bearer <token>`. The two configuration surfaces use the same
-Google OAuth client for two different halves of the job: Obot needs the
-secret to run the flow; this server only ever needs the id to verify what
-comes back.
+Google doesn't support OAuth Dynamic Client Registration, so generic
+MCP-spec discovery alone can't get Obot a client to use. Obot's "Advanced →
+Static OAuth" section on a Remote entry is exactly the escape hatch for
+this: fill in the same Google OAuth client's **Client ID and Client
+Secret** there (the same client the [Google Cloud
+setup](#google-cloud-setup-one-time-15-minutes) above produced). Obot's
+static-OAuth code builds the redirect URL itself from a fixed path
+(`system.MCPOAuthCallbackURL`), so it's the same one registered below
+regardless of how many Remote/static-OAuth entries you add.
+
+This server still needs the same client's `client_id` (not the secret) via
+`GTASKS_MCP_CREDENTIALS` — `{"client_id": "…"}` is enough — purely to verify
+the audience of whatever access token Obot forwards it; that verification is
+independent of, and doesn't need to agree on structure with, Obot's own
+Static OAuth config.
 
 Before Obot's OAuth flow will work, add Obot's callback as an authorized
 redirect URI on that same Google Cloud OAuth client:
@@ -130,10 +134,10 @@ https://<your-obot-host>/oauth/mcp/callback
 ```
 
 This is a single fixed path for the whole Obot instance — Obot's own
-"Static OAuth" callback, shared across every remote/containerized server
-configured this way, not something specific to this catalog entry. It
-routes each completed grant back to the right in-flight per-user request
-via the OAuth `state` parameter, so you only register it once.
+"Static OAuth" callback, shared across every Remote server configured this
+way, not something specific to this catalog entry. It routes each completed
+grant back to the right in-flight per-user request via the OAuth `state`
+parameter, so you only register it once.
 
 Token handling is intentionally minimal-footprint:
 
